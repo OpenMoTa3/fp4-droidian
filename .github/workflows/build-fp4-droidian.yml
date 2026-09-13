@@ -1,0 +1,230 @@
+name: Experimental Droidian FP4 port
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: Fairphone kernel manifest branch
+        required: true
+        default: kernel/11/fp4
+      droidian_version:
+        description: Droidian suite/version
+        required: true
+        default: next
+      rootfs_ui:
+        description: Rootfs UI
+        required: true
+        type: choice
+        options:
+          - phosh
+          - none
+        default: phosh
+      stock_boot_url:
+        description: Optional URL of matching Android 11 FP4 boot.img
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  MANIFEST_URL: https://gerrit-public.fairphone.software/manifest
+  DEVICE_VENDOR: fairphone
+  DEVICE_CODENAME: fp4
+  DEVICE_ARCH: arm64
+  ANDROID_API: 30
+  KERNEL_PATH: kernel/msm-4.19
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            adb fastboot bc bison build-essential cpio curl device-tree-compiler \
+            flex gcc-aarch64-linux-gnu git libelf-dev libssl-dev lz4 \
+            python3 python3-pip repo rsync unzip wget xz-utils zstd
+
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Enable Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Fetch Fairphone kernel branch
+        env:
+          KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/src"
+          cd "$GITHUB_WORKSPACE/src"
+          repo init --depth=1 -u "$MANIFEST_URL" -b "$KERNEL_BRANCH"
+          repo sync --current-branch --no-tags -j2
+          test -d "$KERNEL_PATH"
+
+      - name: Download optional stock boot image
+        env:
+          STOCK_BOOT_URL: ${{ inputs.stock_boot_url }}
+        run: |
+          if [ -n "$STOCK_BOOT_URL" ]; then
+            curl -fL --retry 3 "$STOCK_BOOT_URL" -o "$GITHUB_WORKSPACE/src/boot.img"
+          else
+            echo 'No stock_boot_url supplied; boot image packaging will be skipped.'
+          fi
+
+      - name: Build and package the Halium-compatible kernel
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/packages"
+          cd "$GITHUB_WORKSPACE/src/$KERNEL_PATH"
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/src/$KERNEL_PATH:/buildd/sources" \
+            -v "$GITHUB_WORKSPACE/packages:/buildd" \
+            -w /buildd/sources \
+            -e RELENG_HOST_ARCH=arm64 \
+            -e DEBIAN_FRONTEND=noninteractive \
+            quay.io/droidian/build-essential:current-amd64 \
+            bash -euxo pipefail -c '
+              apt-get update
+              apt-get install -y linux-packaging-snippets device-tree-compiler
+              mkdir -p debian/source
+              cp /usr/share/linux-packaging-snippets/kernel-info.mk.example debian/kernel-info.mk
+              printf "3.0 (native)\\n" > debian/source/format
+              printf "13\\n" > debian/compat
+              cat > debian/rules <<"RULES"
+          #!/usr/bin/make -f
+          include /usr/share/linux-packaging-snippets/kernel-snippet.mk
+          %:
+          \tdh $@
+          RULES
+              chmod +x debian/rules
+
+              # FP4 Android 11 kernel defaults. The boot image step below is
+              # deliberately optional because boot header values must match
+              # the exact installed firmware build.
+              cat >> debian/kernel-info.mk <<"INFO"
+          KERNEL_VENDOR = fairphone
+          KERNEL_DEVICE = fp4
+          KERNEL_ARCH = arm64
+          DEB_BUILD_FOR = arm64
+          KERNEL_DEFCONFIG = vendor/fp4-perf_defconfig
+          KERNEL_IMAGE = Image
+          BUILD_CC = clang
+          KERNEL_CONFIG_USE_FRAGMENTS = 0
+          FLASH_ENABLED = 0
+          INFO
+
+              rm -f debian/control
+              debian/rules debian/control
+              RELENG_HOST_ARCH=arm64 releng-build-package
+            '
+
+      - name: Clone Droidian build tools
+        run: |
+          git clone --depth=1 https://github.com/droidian-releng/droidian-build-tools.git "$GITHUB_WORKSPACE/droidian-build-tools"
+
+      - name: Generate device adaptation and rootfs recipe
+        env:
+          DROIDIAN_VERSION: ${{ inputs.droidian_version }}
+          ROOTFS_UI: ${{ inputs.rootfs_ui }}
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/droidian-build-tools/bin"
+
+          ./droidian-new-device \
+            -v "$DEVICE_VENDOR" \
+            -n "$DEVICE_CODENAME" \
+            -c "$DEVICE_ARCH" \
+            -a "$ANDROID_API" \
+            -r phone \
+            -d droidian
+
+          DEVICE_DIR="$GITHUB_WORKSPACE/droidian-build-tools/bin/droidian/$DEVICE_VENDOR/$DEVICE_CODENAME"
+          ADAPT="$DEVICE_DIR/packages/adaptation-$DEVICE_VENDOR-$DEVICE_CODENAME"
+          mkdir -p "$ADAPT/droidian" "$ADAPT/sparse/etc/apt/sources.list.d"
+
+          # Make the generated adaptation package depend on all kernel debs.
+          # This keeps the workflow self-contained and avoids committing a
+          # device package repository merely for the first experiment.
+          if [ -f "$ADAPT/debian/control" ]; then
+            for deb in "$GITHUB_WORKSPACE"/packages/linux-*.deb; do
+              [ -f "$deb" ] || continue
+              pkg=$(dpkg-deb -f "$deb" Package)
+              sed -i "/^Depends:/ s/$/, $pkg/" "$ADAPT/debian/control" || true
+            done
+          fi
+
+          cp "$GITHUB_WORKSPACE"/packages/linux-*.deb "$ADAPT/droidian/" 2>/dev/null || true
+          cp -a "$ADAPT/droidian/." "$DEVICE_DIR/droidian/" 2>/dev/null || true
+
+          # Generate the rootfs recipe supplied by Droidian tooling.
+          cd "$DEVICE_DIR/droidian"
+          DROIDIAN_VERSION="$DROIDIAN_VERSION" \
+            "$GITHUB_WORKSPACE/droidian-build-tools/bin/rootfs-builder/generate_device_recipe.py" \
+            "${DEVICE_VENDOR}_${DEVICE_CODENAME}" \
+            "$DEVICE_ARCH" "$ROOTFS_UI" phone "$ANDROID_API" || \
+          DROIDIAN_VERSION="$DROIDIAN_VERSION" \
+            ./generate_device_recipe.py \
+            "${DEVICE_VENDOR}_${DEVICE_CODENAME}" \
+            "$DEVICE_ARCH" "$ROOTFS_UI" phone "$ANDROID_API"
+
+      - name: Build adaptation package and Droidian rootfs
+        env:
+          DROIDIAN_VERSION: ${{ inputs.droidian_version }}
+        run: |
+          set -euxo pipefail
+          DEVICE_DIR="$GITHUB_WORKSPACE/droidian-build-tools/bin/droidian/$DEVICE_VENDOR/$DEVICE_CODENAME"
+          mkdir -p "$DEVICE_DIR/droidian/images"
+
+          docker run --rm --privileged \
+            -v "$GITHUB_WORKSPACE/droidian-build-tools:/buildd/tools" \
+            -v "$GITHUB_WORKSPACE/packages:/buildd/packages" \
+            -v "$DEVICE_DIR:/buildd/device" \
+            -v /dev:/host-dev \
+            -v /sys/fs/cgroup:/sys/fs/cgroup \
+            --security-opt seccomp=unconfined \
+            --cgroupns host \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e DROIDIAN_VERSION="$DROIDIAN_VERSION" \
+            quay.io/droidian/rootfs-builder:current-amd64 \
+            /bin/sh -euxo pipefail -c '
+              apt-get update
+              apt-get install -y dpkg-dev gpg apt-utils git
+              cd /buildd/tools/bin
+              ./droidian-build-package || true
+              cd /buildd/device/droidian
+              test -f generated/droidian.yaml
+              debos --disable-fakemachine generated/droidian.yaml
+            '
+
+      - name: Collect raw kernel and build metadata
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cp -a packages/. artifacts/ 2>/dev/null || true
+          find src/$KERNEL_PATH/build/arch/arm64/boot -maxdepth 1 -type f \
+            -exec cp -a {} artifacts/ \; 2>/dev/null || true
+          find droidian-build-tools -type f \( -name '*.img' -o -name '*.zip' -o -name '*.deb' \) \
+            -exec cp -a {} artifacts/ \; 2>/dev/null || true
+          {
+            echo "manifest=$MANIFEST_URL"
+            echo "kernel_branch=${{ inputs.kernel_branch }}"
+            echo "droidian_version=${{ inputs.droidian_version }}"
+            echo "device=$DEVICE_VENDOR/$DEVICE_CODENAME"
+            echo "commit=$GITHUB_SHA"
+          } > artifacts/build-info.txt
+          find artifacts -maxdepth 2 -type f -printf '%p\n' | sort
+
+      - name: Upload all build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fp4-droidian-experimental-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
