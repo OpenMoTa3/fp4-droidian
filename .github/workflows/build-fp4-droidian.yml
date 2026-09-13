@@ -86,12 +86,37 @@ jobs:
             -v "$GITHUB_WORKSPACE/src/$KERNEL_PATH:/buildd/sources" \
             -v "$GITHUB_WORKSPACE/packages:/buildd" \
             -w /buildd/sources \
+            -e ARCH=arm64 \
+            -e CROSS_COMPILE=aarch64-linux-gnu- \
+            -e CLANG_TRIPLE=aarch64-linux-gnu- \
+            -e LLVM=1 \
+            -e LLVM_IAS=1 \
             -e RELENG_HOST_ARCH=arm64 \
             -e DEBIAN_FRONTEND=noninteractive \
             quay.io/droidian/build-essential:current-amd64 \
             bash -euxo pipefail -c '
               apt-get update
-              apt-get install -y linux-packaging-snippets device-tree-compiler
+              apt-get install -y linux-packaging-snippets device-tree-compiler \
+                clang llvm lld gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+              # The previous failure came from clang invoking the host x86
+              # assembler. Force the ARM64 target and LLVM integrated assembler.
+              export ARCH=arm64
+              export CROSS_COMPILE=aarch64-linux-gnu-
+              export CLANG_TRIPLE=aarch64-linux-gnu-
+              export LLVM=1
+              export LLVM_IAS=1
+              # This old 4.19 Kbuild does not reliably infer the target
+              # triple from CROSS_COMPILE when CC is clang. Without an
+              # explicit target clang calls the host x86 assembler, which
+              # produces: /usr/bin/as: unrecognized option '-EL'.
+              export CC="clang --target=aarch64-linux-gnu"
+              export HOSTCC=gcc
+              export HOSTCXX=g++
+
+              clang --version
+              aarch64-linux-gnu-as --version | head -n 1
+
               mkdir -p debian/source
               cp /usr/share/linux-packaging-snippets/kernel-info.mk.example debian/kernel-info.mk
               printf "3.0 (native)\\n" > debian/source/format
@@ -104,9 +129,6 @@ jobs:
           RULES
               chmod +x debian/rules
 
-              # FP4 Android 11 kernel defaults. The boot image step below is
-              # deliberately optional because boot header values must match
-              # the exact installed firmware build.
               cat >> debian/kernel-info.mk <<"INFO"
           KERNEL_VENDOR = fairphone
           KERNEL_DEVICE = fp4
@@ -121,7 +143,12 @@ jobs:
 
               rm -f debian/control
               debian/rules debian/control
-              RELENG_HOST_ARCH=arm64 releng-build-package
+              RELENG_HOST_ARCH=arm64 \
+                ARCH=arm64 \
+                CROSS_COMPILE=aarch64-linux-gnu- \
+                CLANG_TRIPLE=aarch64-linux-gnu- \
+                LLVM=1 LLVM_IAS=1 \
+                releng-build-package
             '
 
       - name: Clone Droidian build tools
