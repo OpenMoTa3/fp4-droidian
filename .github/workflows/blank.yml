@@ -33,7 +33,7 @@ jobs:
       - name: Run a multi-line script
         run: |
           mkdir fp4-kernel && cd fp4-kernel
-          repo init -u https://gerrit-public.fairphone.software/manifest -b kernel/13/fp4
+          repo init -u https://gerrit-public.fairphone.software/manifest -b kernel/11/fp4
           repo sync --detach --current-branch --no-tags
           cd kernel/msm-4.19
           export ARCH=arm64; export CROSS_COMPILE=aarch64-linux-gnu-
