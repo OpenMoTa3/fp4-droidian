@@ -1,43 +1,103 @@
-# This is a basic workflow to help you get started with Actions
+name: Build Fairphone 4 Kernel
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: sudo apt install -y repo make
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Free Disk Space
         run: |
-          mkdir fp4-kernel && cd fp4-kernel
-          repo init -u https://gerrit-public.fairphone.software/manifest -b kernel/11/fp4
-          repo sync --detach --current-branch --no-tags
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            repo \
+            git-core \
+            gnupg \
+            flex \
+            bison \
+            build-essential \
+            zip \
+            curl \
+            zlib1g-dev \
+            libc6-dev-i386 \
+            libncurses5 \
+            libncurses5-dev \
+            libssl-dev \
+            libelf-dev \
+            rsync \
+            bc \
+            python3 \
+            python2 \
+            cpio
+
+      - name: Sync Kernel Source
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global http.version HTTP/1.1
+          export REPO_NO_CLONE_BUNDLE=1
+
+          mkdir -p fp4-kernel
+          cd fp4-kernel
+
+          repo init -u https://gerrit-public.fairphone.software/manifest -b kernel/11/fp4 --no-clone-bundle
+          repo sync --detach --current-branch --no-tags -j$(nproc)
+
+      - name: Build Kernel
+        run: |
+          cd fp4-kernel
+          ROOT_DIR=$(pwd)
+
+          # 自动匹配预编译工具链目录
+          CLANG_DIR=$(find "$ROOT_DIR/prebuilts/clang/host/linux-x86" -maxdepth 1 -name "clang-*" | sort -V | tail -n 1)
+          GCC_64_DIR=$(find "$ROOT_DIR/prebuilts/gcc/linux-x86/aarch64" -maxdepth 1 -name "aarch64-linux-android-*" | sort -V | tail -n 1)
+          GCC_32_DIR=$(find "$ROOT_DIR/prebuilts/gcc/linux-x86/arm" -maxdepth 1 -name "arm-linux-androideabi-*" | sort -V | tail -n 1)
+
+          echo "Using Clang: $CLANG_DIR"
+          echo "Using GCC 64: $GCC_64_DIR"
+          echo "Using GCC 32: $GCC_32_DIR"
+
+          export PATH="$CLANG_DIR/bin:$GCC_64_DIR/bin:$GCC_32_DIR/bin:$PATH"
+
           cd kernel/msm-4.19
-          export ARCH=arm64; export CROSS_COMPILE=aarch64-linux-gnu-
-          export KBUILD_OUTPUT=build
-          make CC=clang LLVM=1 vendor/fp4-perf_defconfig
-          make CC=clang LLVM=1 vendor/fp4_defconfig
-          make CC=clang LLVM=1 -j$(nproc)
+
+          # 1. 生成配置文件
+          make O=build ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            vendor/fp4-perf_defconfig
+
+          # 2. 编译内核与设备树
+          make O=build ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            -j$(nproc)
+
+          # 3. 整理输出文件
+          mkdir -p "$ROOT_DIR/output"
+          cp build/arch/arm64/boot/Image.gz "$ROOT_DIR/output/" || true
+          cp build/arch/arm64/boot/Image.gz-dtb "$ROOT_DIR/output/" || true
+          cp build/arch/arm64/boot/dtbo.img "$ROOT_DIR/output/" || true
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fp4-kernel-msm-4.19
+          path: fp4-kernel/output/*
+          if-no-files-found: error
